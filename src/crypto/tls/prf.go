@@ -117,6 +117,7 @@ var masterSecretLabel = []byte("master secret")
 var keyExpansionLabel = []byte("key expansion")
 var clientFinishedLabel = []byte("client finished")
 var serverFinishedLabel = []byte("server finished")
+var extendedMasterSecretLabel = []byte("extended master secret")
 
 func prfAndHashForVersion(version uint16, suite *cipherSuite) (func(result, secret, label, seed []byte), crypto.Hash) {
 	switch version {
@@ -140,15 +141,22 @@ func prfForVersion(version uint16, suite *cipherSuite) func(result, secret, labe
 }
 
 // masterFromPreMasterSecret generates the master secret from the pre-master
-// secret. See https://tools.ietf.org/html/rfc5246#section-8.1
-func masterFromPreMasterSecret(version uint16, suite *cipherSuite, preMasterSecret, clientRandom, serverRandom []byte) []byte {
-	seed := make([]byte, 0, len(clientRandom)+len(serverRandom))
-	seed = append(seed, clientRandom...)
-	seed = append(seed, serverRandom...)
+// secret. See http://tools.ietf.org/html/rfc5246#section-8.1
+func masterFromPreMasterSecret(version uint16, suite *cipherSuite, preMasterSecret, clientRandom, serverRandom []byte, fin finishedHash, ems bool) []byte {
+	if ems {
+		session_hash := fin.Sum()
+		masterSecret := make([]byte, masterSecretLength)
+		prfForVersion(version, suite)(masterSecret, preMasterSecret, extendedMasterSecretLabel, session_hash)
+		return masterSecret
+	} else {
+		seed := make([]byte, 0, len(clientRandom)+len(serverRandom))
+		seed = append(seed, clientRandom...)
+		seed = append(seed, serverRandom...)
 
-	masterSecret := make([]byte, masterSecretLength)
-	prfForVersion(version, suite)(masterSecret, preMasterSecret, masterSecretLabel, seed)
-	return masterSecret
+		masterSecret := make([]byte, masterSecretLength)
+		prfForVersion(version, suite)(masterSecret, preMasterSecret, masterSecretLabel, seed)
+		return masterSecret
+	}
 }
 
 // keysFromMasterSecret generates the connection keys from the master
@@ -344,44 +352,4 @@ func (h finishedHash) hashForClientCertificate(sigType uint8, hashAlg crypto.Has
 // buffer the entirety of the handshake messages.
 func (h *finishedHash) discardHandshakeBuffer() {
 	h.buffer = nil
-}
-
-// noExportedKeyingMaterial is used as a value of
-// ConnectionState.ekm when renegotation is enabled and thus
-// we wish to fail all key-material export requests.
-func noExportedKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
-	return nil, errors.New("crypto/tls: ExportKeyingMaterial is unavailable when renegotiation is enabled")
-}
-
-// ekmFromMasterSecret generates exported keying material as defined in
-// https://tools.ietf.org/html/rfc5705.
-func ekmFromMasterSecret(version uint16, suite *cipherSuite, masterSecret, clientRandom, serverRandom []byte) func(string, []byte, int) ([]byte, error) {
-	return func(label string, context []byte, length int) ([]byte, error) {
-		switch label {
-		case "client finished", "server finished", "master secret", "key expansion":
-			// These values are reserved and may not be used.
-			return nil, fmt.Errorf("crypto/tls: reserved ExportKeyingMaterial label: %s", label)
-		}
-
-		seedLen := len(serverRandom) + len(clientRandom)
-		if context != nil {
-			seedLen += 2 + len(context)
-		}
-		seed := make([]byte, 0, seedLen)
-
-		seed = append(seed, clientRandom...)
-		seed = append(seed, serverRandom...)
-
-		if context != nil {
-			if len(context) >= 1<<16 {
-				return nil, fmt.Errorf("crypto/tls: ExportKeyingMaterial context too long")
-			}
-			seed = append(seed, byte(len(context)>>8), byte(len(context)))
-			seed = append(seed, context...)
-		}
-
-		keyMaterial := make([]byte, length)
-		prfForVersion(version, suite)(keyMaterial, masterSecret, []byte(label), seed)
-		return keyMaterial, nil
-	}
 }

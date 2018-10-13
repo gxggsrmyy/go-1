@@ -64,12 +64,12 @@ func (i opensslInput) Read(buf []byte) (n int, err error) {
 }
 
 // opensslOutputSink is an io.Writer that receives the stdout and stderr from
-// an `openssl` process and sends a value to handshakeComplete when it sees a
+// an `openssl` process and sends a value to handshakeConfirmed when it sees a
 // log message from a completed server handshake.
 type opensslOutputSink struct {
-	handshakeComplete chan struct{}
-	all               []byte
-	line              []byte
+	handshakeConfirmed chan struct{}
+	all                []byte
+	line               []byte
 }
 
 func newOpensslOutputSink() *opensslOutputSink {
@@ -91,7 +91,7 @@ func (o *opensslOutputSink) Write(data []byte) (n int, err error) {
 		}
 
 		if bytes.Equal([]byte(opensslEndOfHandshake), o.line[:i]) {
-			o.handshakeComplete <- struct{}{}
+			o.handshakeConfirmed <- struct{}{}
 		}
 		o.line = o.line[i+1:]
 	}
@@ -315,9 +315,9 @@ func (test *clientTest) run(t *testing.T, write bool) {
 
 		for i := 1; i <= test.numRenegotiations; i++ {
 			// The initial handshake will generate a
-			// handshakeComplete signal which needs to be quashed.
+			// handshakeConfirmed signal which needs to be quashed.
 			if i == 1 && write {
-				<-stdout.handshakeComplete
+				<-stdout.handshakeConfirmed
 			}
 
 			// OpenSSL will try to interleave application data and
@@ -364,7 +364,7 @@ func (test *clientTest) run(t *testing.T, write bool) {
 			}()
 
 			if write && test.renegotiationExpectedToFail != i {
-				<-stdout.handshakeComplete
+				<-stdout.handshakeConfirmed
 				stdin <- opensslSendSentinel
 			}
 			<-signalChan
@@ -660,6 +660,8 @@ func TestHandshakeClientCertECDSA(t *testing.T) {
 	runClientTestTLS12(t, test)
 }
 
+// This test is specific to TLS versions which support session tickets (TLSv1.2 and below).
+// Session tickets are obsolete in TLSv1.3 (see 2.2 of TLS RFC)
 func TestClientResumption(t *testing.T) {
 	serverConfig := &Config{
 		CipherSuites: []uint16{TLS_RSA_WITH_RC4_128_SHA, TLS_ECDHE_RSA_WITH_RC4_128_SHA},
@@ -679,6 +681,7 @@ func TestClientResumption(t *testing.T) {
 		ClientSessionCache: NewLRUClientSessionCache(32),
 		RootCAs:            rootCAs,
 		ServerName:         "example.golang",
+		MaxVersion:         VersionTLS12, // Enforce TLSv1.2
 	}
 
 	testResumeState := func(test string, didResume bool) {
@@ -866,7 +869,7 @@ func TestHandshakeClientALPNMatch(t *testing.T) {
 // sctsBase64 contains data from `openssl s_client -serverinfo 18 -connect ritter.vg:443`
 const sctsBase64 = "ABIBaQFnAHUApLkJkLQYWBSHuxOizGdwCjw1mAT5G9+443fNDsgN3BAAAAFHl5nuFgAABAMARjBEAiAcS4JdlW5nW9sElUv2zvQyPoZ6ejKrGGB03gjaBZFMLwIgc1Qbbn+hsH0RvObzhS+XZhr3iuQQJY8S9G85D9KeGPAAdgBo9pj4H2SCvjqM7rkoHUz8cVFdZ5PURNEKZ6y7T0/7xAAAAUeX4bVwAAAEAwBHMEUCIDIhFDgG2HIuADBkGuLobU5a4dlCHoJLliWJ1SYT05z6AiEAjxIoZFFPRNWMGGIjskOTMwXzQ1Wh2e7NxXE1kd1J0QsAdgDuS723dc5guuFCaR+r4Z5mow9+X7By2IMAxHuJeqj9ywAAAUhcZIqHAAAEAwBHMEUCICmJ1rBT09LpkbzxtUC+Hi7nXLR0J+2PmwLp+sJMuqK+AiEAr0NkUnEVKVhAkccIFpYDqHOlZaBsuEhWWrYpg2RtKp0="
 
-func TestHandshakClientSCTs(t *testing.T) {
+func TestHandshakeClientSCTs(t *testing.T) {
 	config := testConfig.Clone()
 
 	scts, err := base64.StdEncoding.DecodeString(sctsBase64)
@@ -979,24 +982,6 @@ func TestRenegotiateTwiceRejected(t *testing.T) {
 	runClientTestTLS12(t, test)
 }
 
-func TestHandshakeClientExportKeyingMaterial(t *testing.T) {
-	test := &clientTest{
-		name:    "ExportKeyingMaterial",
-		command: []string{"openssl", "s_server"},
-		config:  testConfig.Clone(),
-		validate: func(state ConnectionState) error {
-			if km, err := state.ExportKeyingMaterial("test", nil, 42); err != nil {
-				return fmt.Errorf("ExportKeyingMaterial failed: %v", err)
-			} else if len(km) != 42 {
-				return fmt.Errorf("Got %d bytes from ExportKeyingMaterial, wanted %d", len(km), 42)
-			}
-			return nil
-		},
-	}
-	runClientTestTLS10(t, test)
-	runClientTestTLS12(t, test)
-}
-
 var hostnameInSNITests = []struct {
 	in, out string
 }{
@@ -1042,7 +1027,7 @@ func TestHostnameInSNI(t *testing.T) {
 		s.Close()
 
 		var m clientHelloMsg
-		if !m.unmarshal(record) {
+		if m.unmarshal(record) != alertSuccess {
 			t.Errorf("unmarshaling ClientHello for %q failed", tt.in)
 			continue
 		}
@@ -1594,63 +1579,5 @@ func TestGetClientCertificate(t *testing.T) {
 		} else {
 			test.verify(t, i, &result.cs)
 		}
-	}
-}
-
-func TestRSAPSSKeyError(t *testing.T) {
-	// crypto/tls does not support the rsa_pss_pss_xxx SignatureSchemes. If support for
-	// public keys with OID RSASSA-PSS is added to crypto/x509, they will be misused with
-	// the rsa_pss_rsae_xxx SignatureSchemes. Assert that RSASSA-PSS certificates don't
-	// parse, or that they don't carry *rsa.PublicKey keys.
-	b, _ := pem.Decode([]byte(`
------BEGIN CERTIFICATE-----
-MIIDZTCCAhygAwIBAgIUCF2x0FyTgZG0CC9QTDjGWkB5vgEwPgYJKoZIhvcNAQEK
-MDGgDTALBglghkgBZQMEAgGhGjAYBgkqhkiG9w0BAQgwCwYJYIZIAWUDBAIBogQC
-AgDeMBIxEDAOBgNVBAMMB1JTQS1QU1MwHhcNMTgwNjI3MjI0NDM2WhcNMTgwNzI3
-MjI0NDM2WjASMRAwDgYDVQQDDAdSU0EtUFNTMIIBIDALBgkqhkiG9w0BAQoDggEP
-ADCCAQoCggEBANxDm0f76JdI06YzsjB3AmmjIYkwUEGxePlafmIASFjDZl/elD0Z
-/a7xLX468b0qGxLS5al7XCcEprSdsDR6DF5L520+pCbpfLyPOjuOvGmk9KzVX4x5
-b05YXYuXdsQ0Kjxcx2i3jjCday6scIhMJVgBZxTEyMj1thPQM14SHzKCd/m6HmCL
-QmswpH2yMAAcBRWzRpp/vdH5DeOJEB3aelq7094no731mrLUCHRiZ1htq8BDB3ou
-czwqgwspbqZ4dnMXl2MvfySQ5wJUxQwILbiuAKO2lVVPUbFXHE9pgtznNoPvKwQT
-JNcX8ee8WIZc2SEGzofjk3NpjR+2ADB2u3sCAwEAAaNTMFEwHQYDVR0OBBYEFNEz
-AdyJ2f+fU+vSCS6QzohnOnprMB8GA1UdIwQYMBaAFNEzAdyJ2f+fU+vSCS6Qzohn
-OnprMA8GA1UdEwEB/wQFMAMBAf8wPgYJKoZIhvcNAQEKMDGgDTALBglghkgBZQME
-AgGhGjAYBgkqhkiG9w0BAQgwCwYJYIZIAWUDBAIBogQCAgDeA4IBAQCjEdrR5aab
-sZmCwrMeKidXgfkmWvfuLDE+TCbaqDZp7BMWcMQXT9O0UoUT5kqgKj2ARm2pEW0Z
-H3Z1vj3bbds72qcDIJXp+l0fekyLGeCrX/CbgnMZXEP7+/+P416p34ChR1Wz4dU1
-KD3gdsUuTKKeMUog3plxlxQDhRQmiL25ygH1LmjLd6dtIt0GVRGr8lj3euVeprqZ
-bZ3Uq5eLfsn8oPgfC57gpO6yiN+UURRTlK3bgYvLh4VWB3XXk9UaQZ7Mq1tpXjoD
-HYFybkWzibkZp4WRo+Fa28rirH+/wHt0vfeN7UCceURZEx4JaxIIfe4ku7uDRhJi
-RwBA9Xk1KBNF
------END CERTIFICATE-----`))
-	if b == nil {
-		t.Fatal("Failed to decode certificate")
-	}
-	cert, err := x509.ParseCertificate(b.Bytes)
-	if err != nil {
-		return
-	}
-	if _, ok := cert.PublicKey.(*rsa.PublicKey); ok {
-		t.Error("A RSA-PSS certificate was parsed like a PKCS1 one, and it will be mistakenly used with rsa_pss_rsae_xxx signature algorithms")
-	}
-}
-
-func TestCloseClientConnectionOnIdleServer(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	client := Client(clientConn, testConfig.Clone())
-	go func() {
-		var b [1]byte
-		serverConn.Read(b[:])
-		client.Close()
-	}()
-	client.SetWriteDeadline(time.Now().Add(time.Second))
-	err := client.Handshake()
-	if err != nil {
-		if !strings.Contains(err.Error(), "read/write on closed pipe") {
-			t.Errorf("Error expected containing 'read/write on closed pipe' but got '%s'", err.Error())
-		}
-	} else {
-		t.Errorf("Error expected, but no error returned")
 	}
 }

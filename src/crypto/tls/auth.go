@@ -15,18 +15,14 @@ import (
 
 // pickSignatureAlgorithm selects a signature algorithm that is compatible with
 // the given public key and the list of algorithms from the peer and this side.
-// The lists of signature algorithms (peerSigAlgs and ourSigAlgs) are ignored
-// for tlsVersion < VersionTLS12.
 //
 // The returned SignatureScheme codepoint is only meaningful for TLS 1.2,
 // previous TLS versions have a fixed hash function.
-func pickSignatureAlgorithm(pubkey crypto.PublicKey, peerSigAlgs, ourSigAlgs []SignatureScheme, tlsVersion uint16) (sigAlg SignatureScheme, sigType uint8, hashFunc crypto.Hash, err error) {
+func pickSignatureAlgorithm(pubkey crypto.PublicKey, peerSigAlgs, ourSigAlgs []SignatureScheme, tlsVersion uint16) (SignatureScheme, uint8, crypto.Hash, error) {
 	if tlsVersion < VersionTLS12 || len(peerSigAlgs) == 0 {
-		// For TLS 1.1 and before, the signature algorithm could not be
-		// negotiated and the hash is fixed based on the signature type.
-		// For TLS 1.2, if the client didn't send signature_algorithms
+		// If the client didn't specify any signature_algorithms
 		// extension then we can assume that it supports SHA1. See
-		// https://tools.ietf.org/html/rfc5246#section-7.4.1.4.1
+		// http://tools.ietf.org/html/rfc5246#section-7.4.1.4.1
 		switch pubkey.(type) {
 		case *rsa.PublicKey:
 			if tlsVersion < VersionTLS12 {
@@ -49,6 +45,11 @@ func pickSignatureAlgorithm(pubkey crypto.PublicKey, peerSigAlgs, ourSigAlgs []S
 			panic("tls: supported signature algorithm has an unknown hash function")
 		}
 		sigType := signatureFromSignatureScheme(sigAlg)
+		if (sigType == signaturePKCS1v15 || hashAlg == crypto.SHA1) && tlsVersion >= VersionTLS13 {
+			// TLS 1.3 forbids RSASSA-PKCS1-v1_5 and SHA-1 for
+			// handshake messages.
+			continue
+		}
 		switch pubkey.(type) {
 		case *rsa.PublicKey:
 			if sigType == signaturePKCS1v15 || sigType == signatureRSAPSS {
@@ -58,8 +59,6 @@ func pickSignatureAlgorithm(pubkey crypto.PublicKey, peerSigAlgs, ourSigAlgs []S
 			if sigType == signatureECDSA {
 				return sigAlg, sigType, hashAlg, nil
 			}
-		default:
-			return 0, 0, 0, fmt.Errorf("tls: unsupported public key: %T", pubkey)
 		}
 	}
 	return 0, 0, 0, errors.New("tls: peer doesn't support any common signature algorithms")

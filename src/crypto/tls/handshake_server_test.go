@@ -40,9 +40,12 @@ func (zeroSource) Read(b []byte) (n int, err error) {
 var testConfig *Config
 
 func allCipherSuites() []uint16 {
-	ids := make([]uint16, len(cipherSuites))
-	for i, suite := range cipherSuites {
-		ids[i] = suite.id
+	var ids []uint16
+	for _, suite := range cipherSuites {
+		if suite.flags&suiteTLS13 != 0 {
+			continue
+		}
+		ids = append(ids, suite.id)
 	}
 
 	return ids
@@ -232,7 +235,7 @@ func TestRenegotiationExtension(t *testing.T) {
 	var serverHello serverHelloMsg
 	// unmarshal expects to be given the handshake header, but
 	// serverHelloLen doesn't include it.
-	if !serverHello.unmarshal(buf[5 : 9+serverHelloLen]) {
+	if serverHello.unmarshal(buf[5:9+serverHelloLen]) != alertSuccess {
 		t.Fatalf("Failed to parse ServerHello")
 	}
 
@@ -337,9 +340,11 @@ func TestVersion(t *testing.T) {
 	serverConfig := &Config{
 		Certificates: testConfig.Certificates,
 		MaxVersion:   VersionTLS11,
+		MinVersion:   VersionTLS10,
 	}
 	clientConfig := &Config{
 		InsecureSkipVerify: true,
+		MinVersion:         VersionTLS10,
 	}
 	state, _, err := testHandshake(clientConfig, serverConfig)
 	if err != nil {
@@ -355,10 +360,12 @@ func TestCipherSuitePreference(t *testing.T) {
 		CipherSuites: []uint16{TLS_RSA_WITH_RC4_128_SHA, TLS_RSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_RSA_WITH_RC4_128_SHA},
 		Certificates: testConfig.Certificates,
 		MaxVersion:   VersionTLS11,
+		MinVersion:   VersionTLS10,
 	}
 	clientConfig := &Config{
 		CipherSuites:       []uint16{TLS_RSA_WITH_AES_128_CBC_SHA, TLS_RSA_WITH_RC4_128_SHA},
 		InsecureSkipVerify: true,
+		MinVersion:         VersionTLS10,
 	}
 	state, _, err := testHandshake(clientConfig, serverConfig)
 	if err != nil {
@@ -410,12 +417,14 @@ func TestCrossVersionResume(t *testing.T) {
 	serverConfig := &Config{
 		CipherSuites: []uint16{TLS_RSA_WITH_AES_128_CBC_SHA},
 		Certificates: testConfig.Certificates,
+		MinVersion:   VersionTLS10,
 	}
 	clientConfig := &Config{
 		CipherSuites:       []uint16{TLS_RSA_WITH_AES_128_CBC_SHA},
 		InsecureSkipVerify: true,
 		ClientSessionCache: NewLRUClientSessionCache(1),
 		ServerName:         "servername",
+		MinVersion:         VersionTLS10,
 	}
 
 	// Establish a session at TLS 1.1.
@@ -910,7 +919,7 @@ func TestHandshakeServerEmptyCertificates(t *testing.T) {
 	testClientHelloFailure(t, serverConfig, clientHello, "no certificates")
 }
 
-// TestCipherSuiteCertPreferance ensures that we select an RSA ciphersuite with
+// TestCipherSuiteCertPreference ensures that we select an RSA ciphersuite with
 // an RSA certificate and an ECDSA ciphersuite with an ECDSA certificate.
 func TestCipherSuiteCertPreferenceECDSA(t *testing.T) {
 	config := testConfig.Clone()
@@ -987,6 +996,7 @@ func TestResumptionDisabled(t *testing.T) {
 func TestFallbackSCSV(t *testing.T) {
 	serverConfig := Config{
 		Certificates: testConfig.Certificates,
+		MinVersion:   VersionTLS10,
 	}
 	test := &serverTest{
 		name:   "FallbackSCSV",
@@ -996,24 +1006,6 @@ func TestFallbackSCSV(t *testing.T) {
 		expectHandshakeErrorIncluding: "inappropriate protocol fallback",
 	}
 	runServerTestTLS11(t, test)
-}
-
-func TestHandshakeServerExportKeyingMaterial(t *testing.T) {
-	test := &serverTest{
-		name:    "ExportKeyingMaterial",
-		command: []string{"openssl", "s_client"},
-		config:  testConfig.Clone(),
-		validate: func(state ConnectionState) error {
-			if km, err := state.ExportKeyingMaterial("test", nil, 42); err != nil {
-				return fmt.Errorf("ExportKeyingMaterial failed: %v", err)
-			} else if len(km) != 42 {
-				return fmt.Errorf("Got %d bytes from ExportKeyingMaterial, wanted %d", len(km), 42)
-			}
-			return nil
-		},
-	}
-	runServerTestTLS10(t, test)
-	runServerTestTLS12(t, test)
 }
 
 func benchmarkHandshakeServer(b *testing.B, cipherSuite uint16, curve CurveID, cert []byte, key crypto.PrivateKey) {
@@ -1274,7 +1266,7 @@ var getConfigForClientTests = []struct {
 			config.MaxVersion = VersionTLS11
 			return config, nil
 		},
-		"version 301 when expecting version 302",
+		"protocol version not supported",
 		nil,
 	},
 	{
@@ -1421,21 +1413,3 @@ var testECDSAPrivateKey = &ecdsa.PrivateKey{
 }
 
 var testP256PrivateKey, _ = x509.ParseECPrivateKey(fromHex("30770201010420012f3b52bc54c36ba3577ad45034e2e8efe1e6999851284cb848725cfe029991a00a06082a8648ce3d030107a14403420004c02c61c9b16283bbcc14956d886d79b358aa614596975f78cece787146abf74c2d5dc578c0992b4f3c631373479ebf3892efe53d21c4f4f1cc9a11c3536b7f75"))
-
-func TestCloseServerConnectionOnIdleClient(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	server := Server(serverConn, testConfig.Clone())
-	go func() {
-		clientConn.Write([]byte{'0'})
-		server.Close()
-	}()
-	server.SetReadDeadline(time.Now().Add(time.Second))
-	err := server.Handshake()
-	if err != nil {
-		if !strings.Contains(err.Error(), "read/write on closed pipe") {
-			t.Errorf("Error expected containing 'read/write on closed pipe' but got '%s'", err.Error())
-		}
-	} else {
-		t.Errorf("Error expected, but no error returned")
-	}
-}
