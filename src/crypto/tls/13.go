@@ -21,7 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	sidh "github_com/cloudflare/sidh/sidh"
+	sidh "github.com/cloudflare/sidh/sidh"
 	"golang_org/x/crypto/curve25519"
 )
 
